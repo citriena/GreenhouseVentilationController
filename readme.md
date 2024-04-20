@@ -74,6 +74,7 @@ https://github.com/citriena/GreenhouseVentilationController
 基本表示内容：
 
 | 設定温度 | 動作モード | モーター動作 |
+| - | - | - |
 | 測定温度 | 巻上カウンタ | 加温設定温度 |
 
 * 設定温度：制御設定温度
