@@ -66,7 +66,7 @@ https://github.com/citriena/GreenhouseVentilationController
 基本表示例：
 
 
-| SP : 25. 0 ﾟ AUTO 　 ^|
+| SP : 25. 0 ﾟ  AUTO 　 ^|
 | - |
 |TP : 28. 0 ﾟ 　18s　 5 ﾟ |
 
