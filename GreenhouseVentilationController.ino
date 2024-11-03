@@ -2,11 +2,14 @@
 // グリーンンハウス　フィルム巻上げ換気装置制御装置用 Arduinoスケッチ
 // Arduino sketch for greenhouse ventilation controller
 // https://github.com/citriena/GreenhouseVentilationController
-// V1.0.0
+// V1.1.0
 // Copyright (C) 2024 citriena
 ////////////////////////////////////////////////////////////////
-
-
+// 
+// 1.1.0: 2024年11月02日
+// ・手動停止モード時は電源入れ直してもリセット動作しないように修正
+// ・日付が変わった時にリセット動作するのを止めた。
+// 
 ////////////////////////////////////////////////////////////////
 //                  コンパイル設定
 ////////////////////////////////////////////////////////////////
@@ -14,7 +17,7 @@
 #define ELECTRICITY_LIMIT       // 加温機が電力制限いっぱいの場合はモーター動作中に加温機を動かさないようにする。
 #define RTC_SD                  // RTCやSDを使う場合；将来的には時間帯で温度設定を変更出来るようにしたい。
 #define SdFatLite               // 標準のSDではなくSdFatライブラリを使う場合
-//#define SERIAL_MONITOR        // シリアルモニタ使用（デバッグ用だが使っていない）
+//#define SERIAL_MONITOR          // シリアルモニタ使用（デバッグ用）
 //#define ETHERNET_SHIELD       // Ethernetシールドを使う場合に設定（未実装）
 #define PELTIER_R100            // 使用するシールド基板を設定
 
@@ -144,35 +147,35 @@ typedef enum {// LCD表示画面
 } dispMode_t;
 
 
-typedef enum {         // 制御モード
-  AUTO_MODE,           // 自動制御
-  MANUAL_STOP_MODE,    // 制御停止
-  MANUAL_CLOSE_MODE,   // 全閉
-  MANUAL_OPEN_MODE,    // 全開
-  MANUAL_DEHUMID_MODE, // 除湿モード（終了したら自動制御）
-  MANUAL_RESET_MODE    // 一旦全閉して巻上カウンターリセット
+typedef enum {       // 制御モード
+  C_AUTO_MODE,       // 自動制御
+  C_STOP_MODE,       // 制御停止
+  C_CLOSE_MODE,      // 全閉
+  C_OPEN_MODE,       // 全開
+  C_DEHUMID_MODE,    // 除湿モード（終了したら自動制御）
+  C_RESET_MODE       // 一旦全閉して巻上カウンターリセット
 } controlMode_t;
 
 
 typedef enum {       // 開閉動作モード
-  OPEN_MODE,         // 開動作（自動制御中）
-  CLOSE_MODE,        // 閉動作（自動制御中）
-  PAUSE_MODE,        // 開閉休止（自動制御中）
-  FULL_OPEN_MODE,    // 完全開（手動設定）
-  FULL_CLOSE_MODE,   // 完全閉（手動設定）
-  DEHUMID_MODE,      // 除湿時間（手動設定　その後自動モード）
-  RESET_MODE,        // 電源投入後等一旦全閉して巻上カウンタをリセットする。
-  BREAK_MODE,        // 現在の自動制御動作を中止して休止モードにする。
-  STOP_MODE          // 開閉動作停止
+  W_OPEN_MODE,       // 開動作（自動制御中）
+  W_CLOSE_MODE,      // 閉動作（自動制御中）
+  W_PAUSE_MODE,      // 開閉休止（自動制御中）
+  W_FULL_OPEN_MODE,  // 完全開（手動設定）
+  W_FULL_CLOSE_MODE, // 完全閉（手動設定）
+  W_DEHUMID_MODE,    // 除湿時間（手動設定　その後自動モード）
+  W_RESET_MODE,      // 電源投入後等一旦全閉して巻上カウンタをリセットする。
+  W_BREAK_MODE,      // 現在の自動制御動作を中止して休止モードにする。
+  W_STOP_MODE        // 開閉動作停止
 } windingMode_t;
 
 
 typedef enum {       // 側窓モーター動作モード
+  MOTOR_STOP_MODE,   // モーター停止
   UPWINDING_MODE,    // 巻上動作
   DOWNWINDING_MODE,  // 巻下動作
   UPPER_LIMIT_MODE,  // 巻上限界
-  LOWER_LIMIT_MODE,  // 巻下限界
-  MOTOR_STOP_MODE    // モーター停止
+  LOWER_LIMIT_MODE   // 巻下限界
 } motorMode_t;
 
 
@@ -218,7 +221,7 @@ typedef struct {
 //                       広域変数宣言
 /////////////////////////////////////////////////////////////////
 
-controlMode_t gControlMode = AUTO_MODE;             // 制御モード；モード変更はこれを使う
+controlMode_t gControlMode = C_AUTO_MODE;           // 制御モード；モード変更はこれを使う
 motorMode_t gMotorMode = MOTOR_STOP_MODE;           // モーター動作モード；プログラムで自動処理するので人為的には変更しない。
 
 bool gEditing = false;                              // 設定変更時に使用
@@ -376,12 +379,13 @@ void dataLogging() {
     }
   }
 
-  if ((currentDay != tm.Day) && (gControlMode == AUTO_MODE)) {  // 自動モードでは日が変わるときにリセットし、側窓が確実に閉まるようにする。
-    gControlMode = MANUAL_RESET_MODE;
+/*
+  if ((currentDay != tm.Day) && (gControlMode == C_AUTO_MODE)) {  // 自動モードでは日が変わるときにリセットし、側窓が確実に閉まるようにする。
+    gControlMode = C_RESET_MODE;
     currentDay = tm.Day;
   }
+*/
 }    
-
 
 void minMax(tmElements_t tm, int tempTenFold) {
   static byte prevDay = 0;
@@ -433,178 +437,205 @@ void initMinMax() {
 //                   窓開閉の制御コード
 ///////////////////////////////////////////////////////////
 
-void windowControl(bool countReset) {             // 一秒毎に呼び出される．
-  static int countTime = 0;                       // 動作、休止時間（秒）
-  static bool windowResetMode = false;            // 開閉リセットモード状態
-  static windingMode_t windingMode = RESET_MODE;  // 開閉動作モード
-  static int dehumidTime;                         // 除湿累計時間
+void windowControl(bool countReset) {               // 一秒毎に呼び出される。
+  static int countTime = 0;                         // 自動制御時の巻動作、休止時間（秒）
+  static bool inResetMode = false;                  // 巻上カウンタリセット中のフラグ
+  static bool resetFinished = false;                // 巻上カウンタリセット済みのフラグ
+  static windingMode_t windingMode = W_STOP_MODE;   // 窓開閉動作モード
+  static bool powerOn = true;
+  static int dehumidTime;                           // 除湿累計時間
   static int prevTemp[2] = {-1000, -1000};
-  int diffTemp;                                   // 設定温度に近づいていたらマイナス、離れていたらプラス
+  int diffTemp;                                     // 設定温度に近づいていたらマイナス、離れていたらプラス
 
-  if (countReset && ((windingMode == OPEN_MODE) || (windingMode == CLOSE_MODE) || (windingMode == PAUSE_MODE))) { // カウンターリセットするのは自動制御時のみ
-    countTime = 0;                                // カウンターリセット時は強制的にカウンターをゼロにする。
-    windingMode = PAUSE_MODE;                     
+  if (powerOn) {
+    switch(gControlMode) {
+    case C_STOP_MODE:                               // 停電復旧時に停止モードだったらリセット省略
+      resetFinished = true;                         // 巻上カウンタ復旧するのでリセット済とする。
+      break;
+    case C_OPEN_MODE:                               // 手動開モード時は停電復旧時に巻上カウンタリセットされるので、開度が足りなくなることはない。
+      break;
+    case C_CLOSE_MODE:
+      gTotalUpWindingTime = gUpWindingTimeLimit;    // 手動閉モード時は停電復旧時に巻上カウンタを最大にして確実に閉まるようにする。
+      break;
+    }
+    powerOn = false;
+  }
+
+  if (countReset && ((windingMode == W_OPEN_MODE) || (windingMode == W_CLOSE_MODE) || (windingMode == W_PAUSE_MODE))) { // カウンターリセットするのは自動制御時のみ
+    countTime = 0;                                  // カウンターリセット時は強制的にカウンターをゼロにする。
+    windingMode = W_PAUSE_MODE;                     
+    gMotorMode = MOTOR_STOP_MODE;
     return;
   }
-  if (countTime > 0) countTime--;                 // 毎秒毎に動作カウンターを減らす
 
-  switch(gMotorMode) {                            // モーターの巻上位置を確認；上限，下限かどうか確認
-    case UPWINDING_MODE:
-      if (gTotalUpWindingTime < 0) gTotalUpWindingTime = 0;
-      gTotalUpWindingTime++;
-      if (gTotalUpWindingTime >= gUpWindingTimeLimit) {
-        gMotorMode = UPPER_LIMIT_MODE;
-      }
-      break;
-    case DOWNWINDING_MODE:
-      gTotalUpWindingTime--;
-      if (gTotalUpWindingTime <= -gAdditionalDownWindingTime) {
-        gTotalUpWindingTime = 0;
-        gMotorMode = LOWER_LIMIT_MODE;
-      }
-      break;
-  }
+  if (countTime > 0) countTime--;                   // 毎秒毎に動作カウンターを減らす
 
-  if (windingMode != RESET_MODE) {  // 巻上リセットモード中は動作変更しない。
-    switch(gControlMode) {          // 手動で設定した制御モードに応じて開閉動作モードを設定
-      case AUTO_MODE:
-        if ((windingMode != OPEN_MODE) && (windingMode != CLOSE_MODE) && (windingMode != PAUSE_MODE)) { // 既に自動制御中は変更しない。
-          windingMode = PAUSE_MODE;   // 新たに自動制御に入ったときは休止モード終了からスタート
-          countTime = 0;
-        }
-        break;
-      case MANUAL_OPEN_MODE:
-        windingMode = FULL_OPEN_MODE;
-        break;
-      case MANUAL_CLOSE_MODE:
-        windingMode = FULL_CLOSE_MODE;
-        break;
-      case MANUAL_STOP_MODE:
-        windingMode = STOP_MODE;
-        break;
-      case MANUAL_RESET_MODE:
-        windingMode = RESET_MODE;
-        break;
-      case MANUAL_DEHUMID_MODE:
-        if (windingMode != DEHUMID_MODE) {    // 　除湿モードに入る際は除湿時間リセット
-          windingMode = DEHUMID_MODE;
-          dehumidTime = 0;
-        }
-        break;
+  switch(gControlMode) {                            // 手動で設定した制御モードに応じて開閉動作モードを選択
+  case C_AUTO_MODE:
+    if ((windingMode != W_OPEN_MODE) && (windingMode != W_CLOSE_MODE) && (windingMode != W_PAUSE_MODE)) { // 既に自動制御中は変更しない。
+      windingMode = W_PAUSE_MODE;                   // 新たに自動制御に入ったときは休止モード終了からスタート
+      countTime = 0;                                // 
     }
-  }
-  if (digitalRead(RAIN_SENSOR_PIN) == LOW) {  // 降雨検出時は閉める。
-    windingMode = FULL_CLOSE_MODE;
+    if (digitalRead(RAIN_SENSOR_PIN) == LOW) {      // 降雨検出時は閉める。
+      windingMode = W_FULL_CLOSE_MODE;
+    }
+    if (!resetFinished) {                           // リセット未実施ならリセット動作
+      windingMode = W_RESET_MODE;
+    }
+    break;
+  case C_OPEN_MODE:
+    windingMode = W_FULL_OPEN_MODE;
+    break;
+  case C_CLOSE_MODE:
+    windingMode = W_FULL_CLOSE_MODE;
+    break;
+  case C_STOP_MODE:
+    windingMode = W_STOP_MODE;
+    break;
+  case C_RESET_MODE:
+    windingMode = W_RESET_MODE;
+    break;
+  case C_DEHUMID_MODE:
+    if (windingMode != W_DEHUMID_MODE) {    // 　除湿モードに入る際は除湿時間リセット
+      windingMode = W_DEHUMID_MODE;
+      dehumidTime = 0;
+    }
+    break;
+  default:
+    windingMode = W_STOP_MODE;
   }
 
-  switch(windingMode) {                       // 各動作モードでの開閉動作の設定
-    case OPEN_MODE:
-    case CLOSE_MODE:
-      if (countTime == 0) {
-        windingMode = PAUSE_MODE;
-        countTime = gPauseTime;
+  switch(windingMode) {                     // 各動作モードでの開閉動作の設定
+  case W_OPEN_MODE:
+  case W_CLOSE_MODE:
+    if (countTime == 0) {
+      windingMode = W_PAUSE_MODE;
+      countTime = gPauseTime;
+    }
+    break;
+  case W_PAUSE_MODE:                                           // 自動運転中の一時休止
+    if (countTime == 0) {                                      // 休止モード終了なら
+      countTime = gPauseTime;                                  // どれにも該当しなかったら休止モード継続のため、最初に設定しておく
+      prevTemp[1] = prevTemp[0];
+      prevTemp[0] = (gActualTemp + 0.05) * 10;                 // 実数から整数変換時に小数点が切り捨てられるので、+0.05して四捨五入にする
+      if (prevTemp[1] == -1000) prevTemp[1] = prevTemp[0];     // 初回は温度変化無しで処理
+      if (prevTemp[0] >= (gSetPoint * 10)) {                   // 設定温度よりも高かったら
+        diffTemp = prevTemp[0] - prevTemp[1];                  // 設定温度から離れるとプラス、近づくとマイナスになるようにする。
+      } else {
+        diffTemp = prevTemp[1] - prevTemp[0];                  // 設定温度から離れるとプラス、近づくとマイナスになるようにする。
       }
-      break;
-    case PAUSE_MODE:                                             // 自動運転中の一時休止
-      if (countTime == 0) {                                      // 休止モード終了なら
-        countTime = gPauseTime;                                  // どれにも該当しなかったら休止モード継続のため、最初に設定しておく
-        prevTemp[1] = prevTemp[0];
-        prevTemp[0] = (gActualTemp + 0.05) * 10;
-        if (prevTemp[0] >= (gSetPoint * 10)) {                   // 設定温度よりも高かったら
-          diffTemp = prevTemp[0] - prevTemp[1];                  // 設定温度から離れるとプラス、近づくとマイナスになるようにする。
-        } else {
-          diffTemp = prevTemp[1] - prevTemp[0];                  // 設定温度から離れるとプラス、近づくとマイナスになるようにする。
+      if ((prevTemp[0] + gSensitivity) < (gSetPoint * 10)) {   // 設定温度よりも低い場合
+        if (diffTemp >= 0) {                                   // 変動無、もしくは設定温度から離れている場合
+          windingMode = W_CLOSE_MODE;                          // 側窓を閉める。
+          countTime = gWindingTime;                            // カウンタを巻き下時間に設定
+          if (diffTemp > 5) {                                  // 前回測定よりも0.5℃以上離れつつある場合は
+            countTime *= 2;                                    // 巻下時間を倍にする。
+          }
         }
-        if ((prevTemp[0] + gSensitivity) < (gSetPoint * 10)) {   // 設定温度よりも低い場合
-          if (diffTemp >= 0) {                                   // 変動無、もしくは設定温度から離れている場合
-            windingMode = CLOSE_MODE;                            // 側窓を閉める。
-            countTime = gWindingTime;                            // カウンタを巻き下時間に設定
-            if (diffTemp > 5) {                                  // 前回測定よりも0.5℃以上離れつつある場合は
-              countTime *= 2;                                    // 巻下時間を倍にする。
-            }
+      } else if ((prevTemp[0] - gSensitivity) > (gSetPoint * 10)) {  //設定温度より高い場合
+        if (diffTemp >= 0) {                                   // 変動無 、もしくは設定温度から離れている場合
+          windingMode = W_OPEN_MODE;                           // 側窓を開ける。
+          countTime = gWindingTime;                            // カウンタを巻き上げ時間に設定
+          if (diffTemp > 5) {                                  // 前回測定よりも0.5℃以上離れている場合は
+            countTime *= 2;                                    // 巻上時間を倍にする。
           }
-        } else if ((prevTemp[0] - gSensitivity) > (gSetPoint * 10)) {  //設定温度より高い場合
-          if (diffTemp >= 0) {                                   // 変動無 、もしくは設定温度から離れている場合
-            windingMode = OPEN_MODE;                             // 側窓を開ける。
-            countTime = gWindingTime;                            // カウンタを巻き上げ時間に設定
-            if (diffTemp > 5) {                                  // 前回測定よりも0.5℃以上離れている場合は
-              countTime *= 2;                                    // 巻上時間を倍にする。
-            }
-          }
-          if (gTotalUpWindingTime < gAdditionalDownWindingTime) {            // 側窓が閉じている場合は、
-            countTime += (gAdditionalDownWindingTime - gTotalUpWindingTime); // 開くところまで時間追加
-          }
+        }
+        if (gTotalUpWindingTime < gAdditionalDownWindingTime) {            // 側窓が閉じている場合は、
+          countTime += (gAdditionalDownWindingTime - gTotalUpWindingTime); // 開くところまで時間追加
         }
       }
-      break;
-    case BREAK_MODE:                                           // 自動処理中に強制的に休止モードにする。今のところ使っていない。
-      windingMode = PAUSE_MODE;
+    }
+    break;
+  case W_BREAK_MODE:                              // 自動処理中に強制的に休止モードにする。今のところ使っていない。
+    windingMode = W_PAUSE_MODE;
+    countTime = 0;
+    break;
+  case W_STOP_MODE:
+//    windingMode = W_STOP_MODE;
+    countTime = 0;
+    break;
+  case W_RESET_MODE:
+    if (!inResetMode) {                           // 既にリセットモードに入っているかどうかの判定
+      gTotalUpWindingTime = gUpWindingTimeLimit;  // 入っていなかったら巻上カウンタを最大にする。
+      gMotorMode = MOTOR_STOP_MODE;               // 下限に達していると強制的にリセットできないので停止モードにする。
+      inResetMode = true;
+      resetFinished = false;
+    } 
+    if (gMotorMode == LOWER_LIMIT_MODE) {         // リセット完了
+      windingMode = W_STOP_MODE;                  // リセットが終わったら停止モードにする。これで設定した制御モードに移行できるようになる。
+      if (gControlMode == C_RESET_MODE) {         // 手動リセットモードのままなら自動制御モードに移行
+        gControlMode = C_AUTO_MODE;
+        writeParam();                             // 停電時は自動制御モードで復旧するようにしておく。
+      }
+      inResetMode = false;
+      resetFinished = true;
       countTime = 0;
-      break;
-    case STOP_MODE:
-      countTime = 0;
-      break;
-    case RESET_MODE:
-      if (!windowResetMode) {                       // 既にリセットモードに入っているかどうかの判定
-        gTotalUpWindingTime = SET_MAX_WIND;         // 入っていたら巻上カウンタを最大にする。
-        gMotorMode = MOTOR_STOP_MODE;               // 下限に達していると強制的にリセットできないので停止モードにする。
-        windowResetMode = true;
-      } 
-      if (gMotorMode == LOWER_LIMIT_MODE) {         // リセット完了
-        windingMode = STOP_MODE;                    // リセットが終わったら停止モードにする。これで設定した制御モードに移行できるようになる。
-        if (gControlMode == MANUAL_RESET_MODE) {    // 手動リセットモードのままなら自動制御モードに移行
-          gControlMode = AUTO_MODE;
-        }
-        windowResetMode = false;
+    }
+    break;
+  case W_DEHUMID_MODE:
+    if (gMotorMode == UPPER_LIMIT_MODE) {         // 全開だったら
+      dehumidTime++;                              // 除湿累計時間加算
+      if ((gDehumidTime * 60) <= dehumidTime) {   // 除湿時間終了なら；gDehumidTimeは分、dehumidTimeは秒なので秒に合わせる。
+        gControlMode = C_AUTO_MODE;               // 自動制御モードに移行
+        windingMode = W_PAUSE_MODE;
         countTime = 0;
+        writeParam();                             // 停電時に自動制御モードで復旧するようにしておく。
       }
-      break;
-    case DEHUMID_MODE:
-      if (gMotorMode == UPPER_LIMIT_MODE) {        // 全開だったら
-        dehumidTime++;                             // 除湿累計時間加算
-        if ((gDehumidTime * 60) <= dehumidTime) {  // 除湿時間終了なら；gDehumidTimeは分、dehumidTimeは秒なので秒に合わせる。
-          gControlMode = AUTO_MODE;                // 自動制御モードに移行
-          windingMode = PAUSE_MODE;
-          countTime = 0;
-        }
-      }
-      break;
+    }
+    break;
   }
 
-  switch(windingMode) { // 設定した開閉モードによりモーターの動作モードを設定
-    case FULL_OPEN_MODE:
-    case OPEN_MODE:
-    case DEHUMID_MODE:
-      if (gMotorMode != UPPER_LIMIT_MODE) {
-        gMotorMode = UPWINDING_MODE;
-      }
-      break;
-    case FULL_CLOSE_MODE:
-    case CLOSE_MODE:
-    case RESET_MODE:
-      if (gMotorMode != LOWER_LIMIT_MODE) {
-        gMotorMode = DOWNWINDING_MODE;
-      }
-      break;
-    case PAUSE_MODE:
-    case BREAK_MODE:     // これは実行されない。
-    case STOP_MODE:
-      if ((gMotorMode != UPPER_LIMIT_MODE) && (gMotorMode != LOWER_LIMIT_MODE)) {
-        gMotorMode = MOTOR_STOP_MODE;
-      }
-      break;
+  switch(windingMode) {                           // 選択した開閉モードによりモーターの動作モードを設定
+  case W_FULL_OPEN_MODE:
+  case W_OPEN_MODE:
+  case W_DEHUMID_MODE:
+    if (gMotorMode != UPPER_LIMIT_MODE) {
+      gMotorMode = UPWINDING_MODE;
+    }
+    break;
+  case W_FULL_CLOSE_MODE:
+  case W_CLOSE_MODE:
+  case W_RESET_MODE:
+    if (gMotorMode != LOWER_LIMIT_MODE) {
+      gMotorMode = DOWNWINDING_MODE;
+    }
+    break;
+  case W_PAUSE_MODE:
+  case W_BREAK_MODE:              // これは実行されない。
+  case W_STOP_MODE:
+    if ((gMotorMode != UPPER_LIMIT_MODE) && (gMotorMode != LOWER_LIMIT_MODE)) {
+      gMotorMode = MOTOR_STOP_MODE;
+    }
+    break;
+  }
+
+  switch(gMotorMode) {             // モーターの巻上位置を確認；上限，下限かどうか確認し、巻上カウンタを更新；停止、再起動後のカウンタがずれるので処理場所を変更
+  case UPWINDING_MODE:
+    if (gTotalUpWindingTime < 0) gTotalUpWindingTime = 0;
+    gTotalUpWindingTime++;
+    if (gTotalUpWindingTime >= gUpWindingTimeLimit) {
+      gMotorMode = UPPER_LIMIT_MODE;
+    }
+    break;
+  case DOWNWINDING_MODE:
+    gTotalUpWindingTime--;
+    if (gTotalUpWindingTime <= -gAdditionalDownWindingTime) {
+      gTotalUpWindingTime = 0;
+      gMotorMode = LOWER_LIMIT_MODE;
+    }
+    break;
   }
 
   int motorValue;
   switch(gMotorMode) {          // 設定したモーターモードに従い，モーターを動作
-    case UPWINDING_MODE:
-      motorValue = 255;
-      break;
-    case DOWNWINDING_MODE:
-      motorValue = -255;
-      break;
-    default:
-      motorValue = 0;
+  case UPWINDING_MODE:
+    motorValue = 255;
+    break;
+  case DOWNWINDING_MODE:
+    motorValue = -255;
+    break;
+  default:
+    motorValue = 0;
   }
 #ifdef ELECTRICITY_LIMIT
   if (motorValue != 0) {        // モーター動作時は電力制限のため加温停止
@@ -612,7 +643,7 @@ void windowControl(bool countReset) {             // 一秒毎に呼び出され
     gHeaterPower = POWER_OFF;
   }
 #endif
-  motor.setSpeed(motorValue);   // モータードライバの出力設定
+  motor.setSpeed(motorValue);   // モータードライバの出力設定; リレーを使う場合はここを変更
 }
 
 
@@ -636,7 +667,7 @@ void heatControl() {
     lowLimit = gHeatTemp;
   }
 
-  if ((gControlMode == AUTO_MODE) && ((int)gActualTemp < lowLimit)) {
+  if ((gControlMode == C_AUTO_MODE) && ((int)gActualTemp < lowLimit)) {
     if (digitalRead(HEATER_LIMIT_PIN) == HIGH) {
       gHeaterPower = POWER_HIGH;
     } else {
@@ -863,22 +894,22 @@ void dispManualMode(btnCODE_t lcd_key) {
   }
   lcd.print(F("MODE:"));
   switch(gCtlParam[MANU_MODE].pValue) {
-    case AUTO_MODE:
+    case C_AUTO_MODE:
       lcd.print(F("AUTO"));
       break;
-    case MANUAL_STOP_MODE:
+    case C_STOP_MODE:
       lcd.print(F("STOP"));
       break;
-    case MANUAL_CLOSE_MODE:
+    case C_CLOSE_MODE:
       lcd.print(F("CLOSE"));
       break;
-    case MANUAL_OPEN_MODE:
+    case C_OPEN_MODE:
       lcd.print(F("OPEN"));
       break;
-    case MANUAL_DEHUMID_MODE:
+    case C_DEHUMID_MODE:
       lcd.print(F("DEHUMID"));
       break;
-    case MANUAL_RESET_MODE:
+    case C_RESET_MODE:
       lcd.print(F("RESET"));
       break;
   }
@@ -1096,35 +1127,6 @@ void dispOffsetMode(btnCODE_t lcd_key) {
 //OFFSET TMP:+0.0C
 //SELECT TO SET
 
-/*
-void dispResetMode(btnCODE_t lcd_key) {
-  lcd.print(F("RESET SETTING"));
-  dispSelect();
-  if (lcd_key == btnSELECT) {
-    EEPROM.write(PARAM_RSRV_ADDR, 0xFF);
-
-    gControlMode = AUTO_MODE;                       // 制御モード；モード変更はこれを使う
-    gMotorMode = MOTOR_STOP_MODE;                   // モーター動作モード；これもプログラムで自動処理するので意図的には変更しない。
-    gUpWindingTimeLimit = SET_MAX_WIND;             // 累計巻上時間の上限
-    gAdditionalDownWindingTime = SET_EXTRA_REWIND;  // 確実に締めるための追加巻下時間
-    gPauseTime = SET_PAUSE_TIME;                    // 自動制御時の一時停止時間
-    gWindingTime = SET_WIND_TIME;                   // 自動制御時の1回の巻上巻下時間
-    gDehumidTime = SET_DEHUMID_TIME;                //
-    gSetPoint = SET_TEMP;                           // 制御設定温度
-    gSensitivity = SET_SENS;                        // 制御感度
-
-#ifdef HEATER
-    gHeatTemp = SET_HEAT_TEMP;                      // 加温開始温度
-    gHeaterPower = POWER_OFF;                       // 加温の状態
-#endif
-//    asm volatile ("  jmp 0");  // ソフトウェアリセット
-    gDispMode = MES_MODE;
-  }
-}
-//0123456789ABCDEF
-//RESET SETTING
-//SELECT TO RESET
-*/
 
 #ifdef RTC_SD
 void dispLogMode(btnCODE_t lcd_key) {
@@ -1218,22 +1220,22 @@ void dispMainMode() {
   lcd.write(0xdf);
 //  lcd.print(F("C "));
   switch(gControlMode) {
-    case AUTO_MODE:
+    case C_AUTO_MODE:
       lcd.print(F("AUTO "));
       break;
-    case MANUAL_OPEN_MODE:
+    case C_OPEN_MODE:
       lcd.print(F("OPEN "));
       break;
-    case MANUAL_CLOSE_MODE:
+    case C_CLOSE_MODE:
       lcd.print(F("CLOSE"));
       break;
-    case MANUAL_STOP_MODE:
+    case C_STOP_MODE:
       lcd.print(F("STOP "));
       break;
-    case MANUAL_RESET_MODE:
+    case C_RESET_MODE:
       lcd.print(F("RESET"));
       break;
-    case MANUAL_DEHUMID_MODE:
+    case C_DEHUMID_MODE:
       lcd.print(F("DEHUM"));
       break;
   }
@@ -1328,6 +1330,9 @@ void readParam() {
 #ifdef RTC_SD
     gLogMode =                   gCtlParam[LOG_MODE].pValue;
 #endif
+    if (gControlMode == C_STOP_MODE) {        // 電源OFF時に手動停止モードの時は、巻上カウンタ値を元に戻す。
+      EEPROM.get(PARAM_RSRV_ADDR + 1 + (PARAM_NUM * sizeof(gCtlParam[0].pValue)), gTotalUpWindingTime);
+    }
   }
 }
 
@@ -1351,6 +1356,9 @@ void writeParam() {
   EEPROM.write(PARAM_RSRV_ADDR, PARAM_RSRV_MARK);
   for (i = 0; i < PARAM_NUM; i++) {
     EEPROM.put(PARAM_RSRV_ADDR + 1 + (i * sizeof(gCtlParam[0].pValue)), gCtlParam[i].pValue);
+  }
+  if (gControlMode == C_STOP_MODE) {        // 電源OFF時に手動停止モードの時は、巻上カウンタ値も保存する。
+    EEPROM.put(PARAM_RSRV_ADDR + 1 + (PARAM_NUM * sizeof(gCtlParam[0].pValue)), gTotalUpWindingTime);
   }
 }
 
